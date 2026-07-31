@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Logical Branch Trace</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="top">
+    <div>
+      <h1>Logical Branch Trace</h1>
+      <p class="sub">Static decision / branch map for a Python directory (or file) — AST only, no AI.</p>
+    </div>
+    <div class="stats" id="stats" hidden></div>
+  </header>
+
+  <section class="panel analyze-panel">
+    <label class="field">
+      <span>Workspace path (directory preferred)</span>
+      <input id="pathInput" type="text" spellcheck="false"
+        placeholder="/absolute/path/to/src" />
+    </label>
+    <button id="analyzeBtn" type="button">Analyze</button>
+    <p id="status" class="status" role="status"></p>
+  </section>
+
+  <section class="panel" id="controls" hidden>
+    <div class="browse-block" id="browseBlock" hidden>
+      <div class="browse-head">
+        <h2 class="inline-h">Browse source</h2>
+        <p class="crumb" id="crumb"></p>
+      </div>
+      <div class="row browse-row">
+        <label class="field grow" id="folderField">
+          <span>1 · Folder</span>
+          <select id="folderSelect"></select>
+        </label>
+        <span class="chevron" aria-hidden="true">→</span>
+        <label class="field grow" id="fileField">
+          <span>2 · File in folder</span>
+          <select id="fileSelect"></select>
+        </label>
+        <label class="field" id="fileFilterField">
+          <span>Filter files</span>
+          <input id="fileFilter" type="search" placeholder="name…" spellcheck="false" />
+        </label>
+      </div>
+      <p class="path-line" id="browseHint"></p>
+    </div>
+
+    <div class="trace-block">
+      <h2 class="inline-h">Trace focus</h2>
+      <div class="row">
+        <label class="field grow">
+          <span>Orchestration path</span>
+          <select id="pathSelect"></select>
+        </label>
+        <label class="field grow">
+          <span>Function zoom</span>
+          <select id="fnSelect"></select>
+        </label>
+        <label class="field">
+          <span>View</span>
+          <div class="seg" id="viewSeg">
+            <button type="button" data-view="path" class="active">Path waterfall</button>
+            <button type="button" data-view="function">Function zoom</button>
+          </div>
+        </label>
+      </div>
+      <p class="path-line" id="pathLine"></p>
+    </div>
+  </section>
+
+  <main id="main" hidden>
+    <section class="panel">
+      <h2>Call graph</h2>
+      <p class="hint">Functions as services. Accent edges follow the selected path.</p>
+      <div class="scroll" id="callGraph"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2 id="waterfallTitle">Distributed logic waterfall</h2>
+          <p class="hint">
+            Top→bottom = evaluation order. Color bars = line span.
+            ↩ = early return. Click a row.
+          </p>
+        </div>
+        <div class="row tools">
+          <div class="seg" id="labelWidthSeg">
+            <button type="button" data-width="compact" class="active">Compact</button>
+            <button type="button" data-width="wide">Wide labels</button>
+            <button type="button" data-width="full">Full + conditions</button>
+          </div>
+        </div>
+      </div>
+      <div class="waterfall-wrap" id="waterfallWrap">
+        <div class="scroll" id="waterfall"></div>
+        <aside class="cond-panel" id="condPanel" hidden>
+          <h3>Conditions (this view)</h3>
+          <p class="hint">Full predicates for rows currently on screen. Click to select.</p>
+          <ol id="condList"></ol>
+        </aside>
+      </div>
+      <div class="legend" id="legend"></div>
+    </section>
+
+    <section class="panel" id="detail" hidden>
+      <h2>Selected span</h2>
+      <div id="detailBody"></div>
+    </section>
+
+    <section class="panel" id="reportPanel" hidden>
+      <div class="panel-head">
+        <div>
+          <h2>Markdown report (for LLM grouping)</h2>
+          <p class="hint">
+            Family-grouped branch dump — copy or download and feed to an LLM to
+            propose higher-level business decision clusters.
+          </p>
+        </div>
+        <div class="row tools">
+          <button type="button" id="btnCopyMd" class="secondary">Copy active</button>
+          <button type="button" id="btnDlMd" class="secondary">Download active.md</button>
+          <button type="button" id="btnWorkspaceMd" class="secondary">Download workspace.md</button>
+        </div>
+      </div>
+      <textarea id="mdPreview" class="md-preview" readonly spellcheck="false"></textarea>
+      <p class="path-line" id="mdStatus"></p>
+    </section>
+
+    <section class="panel">
+      <h2>Condition sequence (first → later)</h2>
+      <div class="scroll">
+        <table id="seqTable">
+          <thead>
+            <tr>
+              <th>#</th><th>Line</th><th>Depth</th><th>Kind</th>
+              <th>Condition</th><th>Family</th><th>↩</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    Local tool · <code>python server.py</code> · analyzer: <code>analyze_branches.py</code>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>
