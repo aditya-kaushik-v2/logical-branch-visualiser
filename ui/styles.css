@@ -65,6 +65,25 @@ code { font-family: var(--mono); font-size: 12px; color: var(--accent); }
 .analyze-panel .status.error { color: var(--danger); }
 .analyze-panel .status.ok { color: var(--ok); }
 
+.diff-panel .hint { margin-top: 0; }
+.diff-row { margin-top: 8px; }
+.diff-panel .status { margin: 8px 0 0; min-height: 1.2em; }
+.diff-panel .status.error { color: var(--danger); }
+.diff-panel .status.ok { color: var(--ok); }
+.diff-panel .stats { margin: 12px 0; }
+.diff-file { margin: 10px 0; padding: 8px 10px; background: var(--elev); border-radius: 8px; border: 1px solid var(--line); }
+.diff-file summary { cursor: pointer; font-size: 13px; }
+.diff-span { margin: 8px 0 0 4px; font-size: 13px; padding-left: 8px; border-left: 3px solid var(--line); }
+.diff-span.added { border-left-color: var(--ok); }
+.diff-span.removed { border-left-color: var(--danger); }
+.diff-span.updated { border-left-color: var(--warn); }
+.diff-mark { font-family: var(--mono); font-weight: 600; }
+.diff-span.added .diff-mark { color: var(--ok); }
+.diff-span.removed .diff-mark { color: var(--danger); }
+.diff-span.updated .diff-mark { color: var(--warn); }
+.diff-cond { margin-top: 2px; color: var(--muted); font-size: 12px; }
+.muted { color: var(--muted); }
+
 .field { display: flex; flex-direction: column; gap: 6px; }
 .field span { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
 .field.grow { flex: 1; min-width: 180px; }

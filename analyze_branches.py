@@ -8,7 +8,8 @@ Builds:
   3. Family grouping of similar predicates (incl. fillna / DF masks)
 
 Usage:
-  python analyze_branches.py [path/to/file.py] [--json out.json] [--summary]
+  python analyze_branches.py [path] [--json out.json] [--summary]
+  python analyze_branches.py [path] --diff-base REV --diff-head REV [--path-filter SUB]
 """
 
 from __future__ import annotations
@@ -17,8 +18,10 @@ import argparse
 import ast
 import json
 import os
+import subprocess
 import sys
 from collections import defaultdict
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -109,10 +112,16 @@ def classify(cond_text: str, kind: str) -> tuple[str, str]:
     return "other_guard", "Other guard / branch"
 
 
-def analyze(path: Path) -> dict[str, Any]:
-    src = path.read_text()
+def analyze_source(
+    src: str,
+    *,
+    source: str,
+    file_name: str | None = None,
+) -> dict[str, Any]:
+    """Analyze Python source text (no filesystem read)."""
     tree = ast.parse(src)
     lines = src.splitlines()
+    display_name = file_name or Path(source).name
 
     # ---- collect function defs ----
     functions: dict[str, dict[str, Any]] = {}
@@ -633,8 +642,8 @@ def analyze(path: Path) -> dict[str, Any]:
 
     return {
         "kind": "file",
-        "source": str(path),
-        "fileName": path.name,
+        "source": source,
+        "fileName": display_name,
         "totalSpans": len(uniq_spans),
         "byKind": dict(kind_counts),
         "families": families,
@@ -681,6 +690,15 @@ def analyze(path: Path) -> dict[str, Any]:
         "flowPaths": flow_paths,
         "traces": traces,
     }
+
+
+def analyze(path: Path) -> dict[str, Any]:
+    path = path.resolve()
+    return analyze_source(
+        path.read_text(),
+        source=str(path),
+        file_name=path.name,
+    )
 
 
 SKIP_DIR_NAMES = {
@@ -1052,6 +1070,536 @@ def workspace_markdown(
     return "\n".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Git revision diff — logical branches added / removed / updated
+# ---------------------------------------------------------------------------
+
+
+def _normalize_condition(cond: str) -> str:
+    return " ".join((cond or "").split())
+
+
+def _span_identity(span: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(span.get("function") or "<module>"),
+        str(span.get("kind") or ""),
+        _normalize_condition(str(span.get("condition") or "")),
+    )
+
+
+def _flatten_spans(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten traces into span dicts that include the owning function."""
+    out: list[dict[str, Any]] = []
+    for t in report.get("traces") or []:
+        fn = t.get("function") or "<module>"
+        for s in t.get("spans") or []:
+            out.append(
+                {
+                    "function": fn,
+                    "id": s.get("id"),
+                    "line": s.get("line"),
+                    "endLine": s.get("endLine"),
+                    "kind": s.get("kind"),
+                    "familyId": s.get("familyId"),
+                    "family": s.get("family"),
+                    "label": s.get("label"),
+                    "condition": s.get("condition"),
+                    "code": s.get("code"),
+                    "earlyExit": s.get("earlyExit"),
+                    "depth": s.get("depth"),
+                }
+            )
+    return out
+
+
+def _public_span(span: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "function": span.get("function"),
+        "line": span.get("line"),
+        "endLine": span.get("endLine"),
+        "kind": span.get("kind"),
+        "familyId": span.get("familyId"),
+        "family": span.get("family"),
+        "label": span.get("label"),
+        "condition": span.get("condition"),
+        "code": span.get("code"),
+        "earlyExit": bool(span.get("earlyExit")),
+        "depth": span.get("depth"),
+    }
+
+
+def compare_span_lists(
+    before: list[dict[str, Any]],
+    after: list[dict[str, Any]],
+    *,
+    similarity_threshold: float = 0.55,
+) -> dict[str, Any]:
+    """
+    Diff two flattened span lists.
+
+    - Exact (function, kind, condition) match → unchanged
+    - Soft match on (function, kind) with high condition similarity → updated
+    - Remainder → added / removed
+    """
+    before_by_key: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    after_by_key: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for s in before:
+        before_by_key[_span_identity(s)].append(s)
+    for s in after:
+        after_by_key[_span_identity(s)].append(s)
+
+    unchanged = 0
+    leftover_before: list[dict[str, Any]] = []
+    leftover_after: list[dict[str, Any]] = []
+
+    all_keys = set(before_by_key) | set(after_by_key)
+    for key in all_keys:
+        b_list = before_by_key.get(key, [])
+        a_list = after_by_key.get(key, [])
+        matched = min(len(b_list), len(a_list))
+        unchanged += matched
+        leftover_before.extend(b_list[matched:])
+        leftover_after.extend(a_list[matched:])
+
+    updated: list[dict[str, Any]] = []
+    used_after: set[int] = set()
+
+    for b in leftover_before:
+        best_i = -1
+        best_score = similarity_threshold
+        b_cond = _normalize_condition(str(b.get("condition") or ""))
+        for i, a in enumerate(leftover_after):
+            if i in used_after:
+                continue
+            if (b.get("function"), b.get("kind")) != (a.get("function"), a.get("kind")):
+                continue
+            a_cond = _normalize_condition(str(a.get("condition") or ""))
+            score = SequenceMatcher(None, b_cond, a_cond).ratio()
+            # Prefer same-ish line when scores are close
+            if abs(int(b.get("line") or 0) - int(a.get("line") or 0)) <= 5:
+                score = min(1.0, score + 0.08)
+            if score > best_score:
+                best_score = score
+                best_i = i
+        if best_i >= 0:
+            used_after.add(best_i)
+            a = leftover_after[best_i]
+            updated.append(
+                {
+                    "before": _public_span(b),
+                    "after": _public_span(a),
+                    "similarity": round(best_score, 3),
+                }
+            )
+
+    updated_before_ids = {
+        (
+            u["before"].get("function"),
+            u["before"].get("kind"),
+            u["before"].get("line"),
+            u["before"].get("condition"),
+        )
+        for u in updated
+    }
+    removed = [
+        _public_span(b)
+        for b in leftover_before
+        if (
+            b.get("function"),
+            b.get("kind"),
+            b.get("line"),
+            b.get("condition"),
+        )
+        not in updated_before_ids
+    ]
+    added = [
+        _public_span(a)
+        for i, a in enumerate(leftover_after)
+        if i not in used_after
+    ]
+
+    return {
+        "added": added,
+        "removed": removed,
+        "updated": updated,
+        "unchanged": unchanged,
+        "summary": {
+            "added": len(added),
+            "removed": len(removed),
+            "updated": len(updated),
+            "unchanged": unchanged,
+        },
+    }
+
+
+def _git(
+    repo: Path,
+    *args: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        check=check,
+    )
+
+
+def git_toplevel(path: Path) -> Path:
+    path = path.resolve()
+    cwd = path if path.is_dir() else path.parent
+    try:
+        cp = _git(cwd, "rev-parse", "--show-toplevel")
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        raise ValueError(f"not a git repository (or git missing): {cwd}") from e
+    return Path(cp.stdout.strip()).resolve()
+
+
+def git_resolve_rev(repo: Path, rev: str) -> str:
+    try:
+        cp = _git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}")
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or e.stdout or str(e)).strip()
+        raise ValueError(f"invalid git revision '{rev}': {err}") from e
+    return cp.stdout.strip()
+
+
+def git_path_relative(repo: Path, path: Path) -> str:
+    """Path relative to repo root (posix). Empty string = whole repo."""
+    path = path.resolve()
+    repo = repo.resolve()
+    if path == repo:
+        return ""
+    try:
+        rel = path.relative_to(repo)
+    except ValueError as e:
+        raise ValueError(f"path {path} is outside git repo {repo}") from e
+    return rel.as_posix()
+
+
+def git_file_at_rev(repo: Path, rev: str, rel_path: str) -> str | None:
+    """Return file contents at rev, or None if missing."""
+    # git show uses path relative to repo; colon form
+    cp = _git(repo, "show", f"{rev}:{rel_path}", check=False)
+    if cp.returncode != 0:
+        return None
+    return cp.stdout
+
+
+def git_changed_python_files(
+    repo: Path,
+    base: str,
+    head: str,
+    pathspec: str,
+) -> list[dict[str, str]]:
+    """
+    List .py files changed between base and head under pathspec.
+
+    Returns [{relPath, status}] where status is A|M|D|R|C (git --name-status).
+    """
+    args = ["diff", "--name-status", "--diff-filter=ACDMR", base, head]
+    if pathspec:
+        args.extend(["--", pathspec])
+    else:
+        args.append("--")
+    cp = _git(repo, *args)
+    files: list[dict[str, str]] = []
+    for line in cp.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        status = parts[0][0]  # R100 → R
+        if status == "R" or status == "C":
+            # rename/copy: STATUS\told\tnew
+            if len(parts) < 3:
+                continue
+            old_path, new_path = parts[1], parts[2]
+            for p, st in ((old_path, "D"), (new_path, "A")):
+                if p.endswith(".py"):
+                    files.append({"relPath": p, "status": st})
+            continue
+        if len(parts) < 2:
+            continue
+        rel = parts[1]
+        if not rel.endswith(".py"):
+            continue
+        files.append({"relPath": rel, "status": status})
+    # Dedupe preferring M over A/D when both appear from renames handled above
+    by_path: dict[str, str] = {}
+    for f in files:
+        prev = by_path.get(f["relPath"])
+        if prev is None:
+            by_path[f["relPath"]] = f["status"]
+        elif prev != f["status"] and {prev, f["status"]} == {"A", "D"}:
+            by_path[f["relPath"]] = "M"
+        else:
+            by_path[f["relPath"]] = f["status"]
+    return [{"relPath": p, "status": s} for p, s in sorted(by_path.items())]
+
+
+def _analyze_rev_file(
+    repo: Path,
+    rev: str,
+    rel_path: str,
+) -> dict[str, Any] | None:
+    src = git_file_at_rev(repo, rev, rel_path)
+    if src is None:
+        return None
+    try:
+        return analyze_source(
+            src,
+            source=f"{rev}:{rel_path}",
+            file_name=Path(rel_path).name,
+        )
+    except SyntaxError:
+        return {"_error": "syntax_error", "source": f"{rev}:{rel_path}"}
+
+
+def compare_logical_branches(
+    path: Path,
+    base: str,
+    head: str,
+    *,
+    path_filter: str | None = None,
+) -> dict[str, Any]:
+    """
+    Compare logical branches between two git commits under ``path``.
+
+    ``path`` may be a git repo root, a subdirectory, or a single ``.py`` file.
+    Optional ``path_filter`` further narrows the git pathspec (relative to path
+    when path is a directory, or relative to repo when absolute-looking).
+    """
+    path = path.resolve()
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+
+    repo = git_toplevel(path)
+    base_sha = git_resolve_rev(repo, base)
+    head_sha = git_resolve_rev(repo, head)
+
+    if path.is_file():
+        if path.suffix != ".py":
+            raise ValueError("path must be a .py file or a directory")
+        pathspec = git_path_relative(repo, path)
+        changed = [{"relPath": pathspec, "status": "M"}]
+        # Still verify it exists on at least one side
+        if (
+            git_file_at_rev(repo, base_sha, pathspec) is None
+            and git_file_at_rev(repo, head_sha, pathspec) is None
+        ):
+            raise FileNotFoundError(
+                f"{pathspec} not found at either {base_sha[:8]} or {head_sha[:8]}"
+            )
+        # Prefer real git status when available
+        real = git_changed_python_files(repo, base_sha, head_sha, pathspec)
+        if real:
+            changed = real
+        elif git_file_at_rev(repo, base_sha, pathspec) is None:
+            changed = [{"relPath": pathspec, "status": "A"}]
+        elif git_file_at_rev(repo, head_sha, pathspec) is None:
+            changed = [{"relPath": pathspec, "status": "D"}]
+    else:
+        base_pathspec = git_path_relative(repo, path)
+        if path_filter:
+            filt = path_filter.strip().lstrip("./")
+            if base_pathspec:
+                pathspec = f"{base_pathspec.rstrip('/')}/{filt}"
+            else:
+                pathspec = filt
+        else:
+            pathspec = base_pathspec
+        changed = git_changed_python_files(repo, base_sha, head_sha, pathspec)
+
+    file_diffs: list[dict[str, Any]] = []
+    totals = {"added": 0, "removed": 0, "updated": 0, "unchanged": 0}
+
+    for entry in changed:
+        rel = entry["relPath"]
+        status = entry["status"]
+        before_report = (
+            None if status == "A" else _analyze_rev_file(repo, base_sha, rel)
+        )
+        after_report = (
+            None if status == "D" else _analyze_rev_file(repo, head_sha, rel)
+        )
+
+        before_spans = (
+            []
+            if before_report is None or before_report.get("_error")
+            else _flatten_spans(before_report)
+        )
+        after_spans = (
+            []
+            if after_report is None or after_report.get("_error")
+            else _flatten_spans(after_report)
+        )
+
+        if status == "A":
+            span_diff = {
+                "added": [_public_span(s) for s in after_spans],
+                "removed": [],
+                "updated": [],
+                "unchanged": 0,
+                "summary": {
+                    "added": len(after_spans),
+                    "removed": 0,
+                    "updated": 0,
+                    "unchanged": 0,
+                },
+            }
+        elif status == "D":
+            span_diff = {
+                "added": [],
+                "removed": [_public_span(s) for s in before_spans],
+                "updated": [],
+                "unchanged": 0,
+                "summary": {
+                    "added": 0,
+                    "removed": len(before_spans),
+                    "updated": 0,
+                    "unchanged": 0,
+                },
+            }
+        else:
+            span_diff = compare_span_lists(before_spans, after_spans)
+
+        # Skip files with no logical-branch changes
+        s = span_diff["summary"]
+        if s["added"] == 0 and s["removed"] == 0 and s["updated"] == 0:
+            continue
+
+        for k in ("added", "removed", "updated", "unchanged"):
+            totals[k] += s[k]
+
+        file_status = {"A": "added", "D": "deleted", "M": "modified"}.get(
+            status, "modified"
+        )
+        file_diffs.append(
+            {
+                "relPath": rel,
+                "status": file_status,
+                "beforeSpans": len(before_spans),
+                "afterSpans": len(after_spans),
+                "spans": {
+                    "added": span_diff["added"],
+                    "removed": span_diff["removed"],
+                    "updated": span_diff["updated"],
+                },
+                "summary": s,
+                "errors": {
+                    "before": (before_report or {}).get("_error"),
+                    "after": (after_report or {}).get("_error"),
+                },
+            }
+        )
+
+    return {
+        "kind": "diff",
+        "repo": str(repo),
+        "path": str(path),
+        "pathspec": pathspec,
+        "base": base,
+        "head": head,
+        "baseSha": base_sha,
+        "headSha": head_sha,
+        "fileCount": len(file_diffs),
+        "summary": totals,
+        "files": file_diffs,
+    }
+
+
+def diff_report_to_markdown(diff: dict[str, Any]) -> str:
+    """LLM / human oriented markdown for a commit-to-commit branch diff."""
+    s = diff.get("summary") or {}
+    lines: list[str] = [
+        "# Logical Branch Diff",
+        "",
+        f"- **repo**: `{diff.get('repo')}`",
+        f"- **path**: `{diff.get('path')}`",
+        f"- **pathspec**: `{diff.get('pathspec') or '.'}`",
+        f"- **base**: `{diff.get('base')}` (`{str(diff.get('baseSha', ''))[:10]}`)",
+        f"- **head**: `{diff.get('head')}` (`{str(diff.get('headSha', ''))[:10]}`)",
+        f"- **files_with_branch_changes**: {diff.get('fileCount', 0)}",
+        f"- **added**: {s.get('added', 0)}",
+        f"- **removed**: {s.get('removed', 0)}",
+        f"- **updated**: {s.get('updated', 0)}",
+        f"- **unchanged** (in touched files): {s.get('unchanged', 0)}",
+        "",
+    ]
+
+    files = diff.get("files") or []
+    if not files:
+        lines.append("_No logical-branch changes between these revisions under the path._")
+        lines.append("")
+        return "\n".join(lines)
+
+    lines.append("## Files")
+    lines.append("")
+    for f in files:
+        fs = f.get("summary") or {}
+        lines.append(
+            f"- `{f['relPath']}` ({f.get('status')}) — "
+            f"+{fs.get('added', 0)} / -{fs.get('removed', 0)} / ~{fs.get('updated', 0)}"
+        )
+    lines.append("")
+
+    for f in files:
+        spans = f.get("spans") or {}
+        lines.append(f"## `{f['relPath']}`")
+        lines.append("")
+        lines.append(
+            f"File status: **{f.get('status')}** · "
+            f"spans {f.get('beforeSpans', 0)} → {f.get('afterSpans', 0)}"
+        )
+        lines.append("")
+
+        added = spans.get("added") or []
+        if added:
+            lines.append("### Added")
+            lines.append("")
+            for sp in added:
+                lines.append(
+                    f"- **+** `{sp.get('function')}` · `{sp.get('kind')}` · "
+                    f"L{sp.get('line')} · _{sp.get('family')}_"
+                )
+                lines.append(f"  - condition: `{sp.get('condition')}`")
+            lines.append("")
+
+        removed = spans.get("removed") or []
+        if removed:
+            lines.append("### Removed")
+            lines.append("")
+            for sp in removed:
+                lines.append(
+                    f"- **-** `{sp.get('function')}` · `{sp.get('kind')}` · "
+                    f"L{sp.get('line')} · _{sp.get('family')}_"
+                )
+                lines.append(f"  - condition: `{sp.get('condition')}`")
+            lines.append("")
+
+        updated = spans.get("updated") or []
+        if updated:
+            lines.append("### Updated")
+            lines.append("")
+            for u in updated:
+                b, a = u.get("before") or {}, u.get("after") or {}
+                lines.append(
+                    f"- **~** `{a.get('function') or b.get('function')}` · "
+                    f"`{a.get('kind') or b.get('kind')}` · "
+                    f"L{b.get('line')}→L{a.get('line')} "
+                    f"(sim {u.get('similarity', '?')})"
+                )
+                lines.append(f"  - before: `{b.get('condition')}`")
+                lines.append(f"  - after: `{a.get('condition')}`")
+            lines.append("")
+
+        lines.append("---")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1063,11 +1611,24 @@ def main() -> int:
             / "data-pipeline"
             / "src"
         ),
-        help="Python file or directory to analyze",
+        help="Python file or directory to analyze (or git path scope for --diff-*)",
     )
     parser.add_argument(
         "--file",
         help="When path is a directory, relative .py file to open as active report",
+    )
+    parser.add_argument(
+        "--diff-base",
+        help="Git commit/ref: compare logical branches from this revision",
+    )
+    parser.add_argument(
+        "--diff-head",
+        help="Git commit/ref: compare logical branches to this revision "
+        "(requires --diff-base)",
+    )
+    parser.add_argument(
+        "--path-filter",
+        help="Optional sub-path under path when using --diff-base/--diff-head",
     )
     parser.add_argument("--json", dest="json_out")
     parser.add_argument(
@@ -1088,6 +1649,80 @@ def main() -> int:
     if not path.exists():
         print(f"Path not found: {path}", file=sys.stderr)
         return 1
+
+    if args.diff_head and not args.diff_base:
+        print("--diff-head requires --diff-base", file=sys.stderr)
+        return 1
+    if args.diff_base and not args.diff_head:
+        print("--diff-base requires --diff-head", file=sys.stderr)
+        return 1
+
+    if args.diff_base and args.diff_head:
+        try:
+            report = compare_logical_branches(
+                path,
+                args.diff_base,
+                args.diff_head,
+                path_filter=args.path_filter,
+            )
+        except (ValueError, FileNotFoundError, subprocess.CalledProcessError) as e:
+            print(f"Diff failed: {e}", file=sys.stderr)
+            return 1
+
+        if args.json_out:
+            out = Path(args.json_out)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(report, indent=2))
+            s = report["summary"]
+            print(
+                f"Wrote diff +{s['added']}/-{s['removed']}/~{s['updated']} → {out}",
+                file=sys.stderr,
+            )
+
+        if args.markdown_out:
+            out = Path(args.markdown_out)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(diff_report_to_markdown(report))
+            print(f"Wrote markdown → {out}", file=sys.stderr)
+
+        if args.summary or (not args.json_out and not args.markdown_out):
+            s = report["summary"]
+            print(f"kind: diff")
+            print(f"repo: {report['repo']}")
+            print(f"path: {report['path']}")
+            print(f"pathspec: {report['pathspec'] or '.'}")
+            print(f"base: {report['base']} ({report['baseSha'][:10]})")
+            print(f"head: {report['head']} ({report['headSha'][:10]})")
+            print(
+                f"branch changes: +{s['added']} / -{s['removed']} / "
+                f"~{s['updated']}  (unchanged in touched files: {s['unchanged']})"
+            )
+            print(f"files with branch changes: {report['fileCount']}")
+            for f in report["files"][:30]:
+                fs = f["summary"]
+                print(
+                    f"  {f['relPath']}  ({f['status']})  "
+                    f"+{fs['added']}/-{fs['removed']}/~{fs['updated']}"
+                )
+                for sp in (f["spans"]["added"] or [])[:5]:
+                    print(
+                        f"    + {sp['function']} {sp['kind']} L{sp['line']}: "
+                        f"{sp['condition'][:80]}"
+                    )
+                for sp in (f["spans"]["removed"] or [])[:5]:
+                    print(
+                        f"    - {sp['function']} {sp['kind']} L{sp['line']}: "
+                        f"{sp['condition'][:80]}"
+                    )
+                for u in (f["spans"]["updated"] or [])[:5]:
+                    b, a = u["before"], u["after"]
+                    print(
+                        f"    ~ {a['function']} {a['kind']} "
+                        f"L{b['line']}→L{a['line']}: "
+                        f"{(b.get('condition') or '')[:40]} → "
+                        f"{(a.get('condition') or '')[:40]}"
+                    )
+        return 0
 
     report = analyze_target(path, file=args.file, max_files=args.max_files)
 

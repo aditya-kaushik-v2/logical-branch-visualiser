@@ -18,7 +18,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from analyze_branches import analyze_target, report_to_markdown, workspace_markdown
+from analyze_branches import (
+    analyze_target,
+    compare_logical_branches,
+    diff_report_to_markdown,
+    report_to_markdown,
+    workspace_markdown,
+)
 
 ROOT = Path(__file__).resolve().parent
 UI_DIR = ROOT / "ui"
@@ -97,6 +103,17 @@ class Handler(BaseHTTPRequestHandler):
             self._run_report(body)
             return
 
+        if parsed.path == "/api/diff":
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                self._json(400, {"error": "invalid JSON body"})
+                return
+            self._run_diff(body)
+            return
+
         if parsed.path != "/api/analyze":
             self._send(404, b"not found", "text/plain")
             return
@@ -111,6 +128,60 @@ class Handler(BaseHTTPRequestHandler):
         file_raw = body.get("file")
         file_raw = str(file_raw).strip() if file_raw else None
         self._run_analyze(path_raw, file_raw)
+
+    def _run_diff(self, body: dict) -> None:
+        """Compare logical branches between two git commits under a path."""
+        path_raw = str(body.get("path") or body.get("repo") or "").strip()
+        base = str(body.get("base") or "").strip()
+        head = str(body.get("head") or "").strip()
+        path_filter = body.get("pathFilter") or body.get("path_filter")
+        path_filter = str(path_filter).strip() if path_filter else None
+        as_markdown = bool(body.get("markdown"))
+
+        if not path_raw:
+            self._json(400, {"error": "missing path (git repo, directory, or .py file)"})
+            return
+        if not base or not head:
+            self._json(400, {"error": "missing base and/or head git revision"})
+            return
+
+        path = Path(path_raw).expanduser()
+        path = path.resolve() if path.is_absolute() else (Path.cwd() / path).resolve()
+        if not path.exists():
+            self._json(404, {"error": f"path not found: {path}"})
+            return
+        if not self._allowed(path):
+            self._json(403, {"error": "path outside allowlisted roots"})
+            return
+
+        try:
+            report = compare_logical_branches(
+                path, base, head, path_filter=path_filter
+            )
+            if as_markdown:
+                self._json(
+                    200,
+                    {
+                        "markdown": diff_report_to_markdown(report),
+                        "summary": report.get("summary"),
+                        "kind": "diff",
+                    },
+                )
+                return
+            self._json(200, report)
+        except FileNotFoundError as e:
+            self._json(404, {"error": str(e)})
+        except ValueError as e:
+            self._json(400, {"error": str(e)})
+        except Exception as e:
+            self._json(
+                500,
+                {
+                    "error": "diff failed",
+                    "detail": str(e),
+                    "trace": traceback.format_exc(),
+                },
+            )
 
     def _run_report(self, body: dict) -> None:
         """Generate markdown report. Body: path, file?, scope=active|workspace, report?"""

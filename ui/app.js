@@ -7,6 +7,7 @@ const COLORS = [
 
 const state = {
   report: null,
+  diffReport: null,
   inputPath: null,
   folder: ".",
   pathId: null,
@@ -40,6 +41,142 @@ function setStatus(msg, kind = "") {
   const el = $("status");
   el.textContent = msg;
   el.className = "status" + (kind ? ` ${kind}` : "");
+}
+
+function setDiffStatus(msg, kind = "") {
+  const el = $("diffStatus");
+  el.textContent = msg;
+  el.className = "status" + (kind ? ` ${kind}` : "");
+}
+
+function renderDiffSpan(prefix, sp, cls) {
+  return (
+    `<div class="diff-span ${cls}">` +
+    `<span class="diff-mark">${prefix}</span> ` +
+    `<code>${escapeHtml(sp.function || "?")}</code> · ` +
+    `<code>${escapeHtml(sp.kind || "")}</code> · L${sp.line ?? "?"} · ` +
+    `<span class="muted">${escapeHtml(sp.family || "")}</span>` +
+    `<div class="diff-cond"><code>${escapeHtml(sp.condition || "")}</code></div>` +
+    `</div>`
+  );
+}
+
+function renderDiffReport(diff) {
+  state.diffReport = diff;
+  const box = $("diffResults");
+  const stats = $("diffStats");
+  const body = $("diffBody");
+  if (!diff) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  const s = diff.summary || {};
+  stats.innerHTML = [
+    ["+" + (s.added || 0), "added"],
+    ["−" + (s.removed || 0), "removed"],
+    ["~" + (s.updated || 0), "updated"],
+    [String(diff.fileCount || 0), "files"],
+  ]
+    .map(
+      ([n, label]) =>
+        `<div class="stat"><b>${escapeHtml(String(n))}</b><span>${escapeHtml(label)}</span></div>`
+    )
+    .join("");
+
+  const files = diff.files || [];
+  if (!files.length) {
+    body.innerHTML =
+      `<p class="hint">No logical-branch changes between ` +
+      `<code>${escapeHtml(diff.base)}</code> and <code>${escapeHtml(diff.head)}</code>.</p>`;
+    return;
+  }
+
+  body.innerHTML = files
+    .map((f) => {
+      const fs = f.summary || {};
+      const spans = f.spans || {};
+      const parts = [];
+      for (const sp of spans.added || []) parts.push(renderDiffSpan("+", sp, "added"));
+      for (const sp of spans.removed || []) parts.push(renderDiffSpan("−", sp, "removed"));
+      for (const u of spans.updated || []) {
+        const b = u.before || {};
+        const a = u.after || {};
+        parts.push(
+          `<div class="diff-span updated">` +
+            `<span class="diff-mark">~</span> ` +
+            `<code>${escapeHtml(a.function || b.function || "?")}</code> · ` +
+            `<code>${escapeHtml(a.kind || b.kind || "")}</code> · ` +
+            `L${b.line ?? "?"}→L${a.line ?? "?"} ` +
+            `<span class="muted">(sim ${u.similarity ?? "?"})</span>` +
+            `<div class="diff-cond">before: <code>${escapeHtml(b.condition || "")}</code></div>` +
+            `<div class="diff-cond">after: <code>${escapeHtml(a.condition || "")}</code></div>` +
+            `</div>`
+        );
+      }
+      return (
+        `<details class="diff-file" open>` +
+        `<summary><code>${escapeHtml(f.relPath)}</code> ` +
+        `<span class="muted">(${escapeHtml(f.status)}) ` +
+        `+${fs.added || 0}/−${fs.removed || 0}/~${fs.updated || 0}</span></summary>` +
+        parts.join("") +
+        `</details>`
+      );
+    })
+    .join("");
+}
+
+async function runDiff() {
+  const path = ($("pathInput").value || "").trim();
+  const base = ($("diffBaseInput").value || "").trim();
+  const head = ($("diffHeadInput").value || "").trim();
+  const pathFilter = ($("diffPathFilter").value || "").trim() || null;
+  if (!path) {
+    setDiffStatus("Set a workspace path first.", "error");
+    return;
+  }
+  if (!base || !head) {
+    setDiffStatus("Base and head commits are required.", "error");
+    return;
+  }
+  $("diffBtn").disabled = true;
+  setDiffStatus("Diffing logical branches…");
+  try {
+    const res = await fetch("/api/diff", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, base, head, pathFilter }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || data.detail || res.statusText);
+    renderDiffReport(data);
+    const s = data.summary || {};
+    setDiffStatus(
+      `Diff ${data.baseSha?.slice(0, 8)}…${data.headSha?.slice(0, 8)} · ` +
+        `+${s.added || 0} / −${s.removed || 0} / ~${s.updated || 0}`,
+      "ok"
+    );
+  } catch (err) {
+    renderDiffReport(null);
+    setDiffStatus(String(err.message || err), "error");
+  } finally {
+    $("diffBtn").disabled = false;
+  }
+}
+
+async function fetchDiffMarkdown() {
+  const path = ($("pathInput").value || "").trim();
+  const base = ($("diffBaseInput").value || "").trim();
+  const head = ($("diffHeadInput").value || "").trim();
+  const pathFilter = ($("diffPathFilter").value || "").trim() || null;
+  const res = await fetch("/api/diff", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, base, head, pathFilter, markdown: true }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || data.detail || res.statusText);
+  return data.markdown || "";
 }
 
 /** Parent folder of a relative file path. Root files → "." */
@@ -970,6 +1107,33 @@ function wire() {
     $("mdStatus").textContent = "Downloaded active-file markdown.";
   });
   $("btnWorkspaceMd").addEventListener("click", () => downloadWorkspaceMarkdown());
+
+  $("diffBtn").addEventListener("click", () => runDiff());
+  ["diffBaseInput", "diffHeadInput", "diffPathFilter"].forEach((id) => {
+    $(id).addEventListener("keydown", (e) => {
+      if (e.key === "Enter") runDiff();
+    });
+  });
+  $("btnCopyDiffMd").addEventListener("click", async () => {
+    try {
+      const md = await fetchDiffMarkdown();
+      await navigator.clipboard.writeText(md);
+      setDiffStatus("Copied diff markdown.", "ok");
+    } catch (err) {
+      setDiffStatus(String(err.message || err), "error");
+    }
+  });
+  $("btnDlDiffMd").addEventListener("click", async () => {
+    try {
+      const md = await fetchDiffMarkdown();
+      const base = ($("diffBaseInput").value || "base").slice(0, 8);
+      const head = ($("diffHeadInput").value || "head").slice(0, 8);
+      downloadText(`logical-branch-diff-${base}-${head}.md`, md);
+      setDiffStatus("Downloaded diff markdown.", "ok");
+    } catch (err) {
+      setDiffStatus(String(err.message || err), "error");
+    }
+  });
 
   const defaultPath = new URLSearchParams(location.search).get("path") || "";
   if (defaultPath) {

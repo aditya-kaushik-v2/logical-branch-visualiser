@@ -29,7 +29,8 @@ Logical Branch Trace turns them into:
 - Path waterfall and per-function zoom (line range ≈ duration, nesting ≈ span depth)
 - Label modes: Compact / Wide / Full + conditions side panel
 - Markdown report: copy, download active file, or whole workspace
-- CLI for CI / scripting (`--json`, `--markdown`, `--workspace-markdown`)
+- **Commit diff** — compare logical branches added / removed / updated between any two git revisions under a path
+- CLI for CI / scripting (`--json`, `--markdown`, `--workspace-markdown`, `--diff-base` / `--diff-head`)
 - Optional filesystem allowlist (`--root`) for safer local serving
 
 ## Requirements
@@ -85,8 +86,29 @@ python analyze_branches.py /path/to/src --markdown branches.md
 
 # Full workspace Markdown (every .py with spans)
 python analyze_branches.py /path/to/src --markdown workspace.md --workspace-markdown
+
+# Logical branches added/removed/updated between two commits (path-scoped)
+python analyze_branches.py /path/to/repo/or/subdir \
+  --diff-base abc1234 \
+  --diff-head def5678 \
+  --summary
+
+# Narrow further with a path filter + JSON / markdown
+python analyze_branches.py /path/to/repo \
+  --diff-base origin/main \
+  --diff-head HEAD \
+  --path-filter services/data-pipeline/src \
+  --json branch-diff.json \
+  --markdown branch-diff.md
 ```
 
+Matching rules for the diff:
+
+- **Unchanged** — same function + kind + condition text  
+- **Updated** — same function + kind, condition edited (fuzzy match)  
+- **Added / removed** — everything else  
+
+Only `.py` files that differ between the two revisions are analyzed.
 ## HTTP API
 
 | Method | Path | Body / query | Response |
@@ -97,6 +119,8 @@ python analyze_branches.py /path/to/src --markdown workspace.md --workspace-mark
 | `POST` | `/api/analyze` | `{"path":"/abs/file.py"}` | Single-file report |
 | `POST` | `/api/report` | `{"path":"…","scope":"active"\|"workspace"}` | `{"markdown":"…"}` |
 | `POST` | `/api/report` | `{"scope":"active","report":{…}}` | Markdown from an in-memory report |
+| `POST` | `/api/diff` | `{"path":"/abs/dir","base":"abc","head":"def","pathFilter"?}` | Branch add/remove/update report |
+| `POST` | `/api/diff` | `{…, "markdown": true}` | `{markdown, summary}` for the same diff |
 
 `GET /api/analyze?path=…&file=…` is also supported.
 
@@ -170,7 +194,6 @@ Edit `ui/*` and hard-refresh the browser (no build step). Restart `server.py` af
 
 - Cross-file import-aware call graphs  
 - Configurable family classifiers  
-- Diff two revisions’ branch reports  
 - SARIF or custom JSON schema export for CI gates  
 
 ## Contributing

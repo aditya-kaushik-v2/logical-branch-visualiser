@@ -25,6 +25,35 @@
     <p id="status" class="status" role="status"></p>
   </section>
 
+  <section class="panel diff-panel">
+    <h2 class="inline-h">Compare commits</h2>
+    <p class="hint">Logical branches added / removed / updated between two git revisions under the path above.</p>
+    <div class="row diff-row">
+      <label class="field grow">
+        <span>Base commit</span>
+        <input id="diffBaseInput" type="text" spellcheck="false" placeholder="abc1234 or main" />
+      </label>
+      <label class="field grow">
+        <span>Head commit</span>
+        <input id="diffHeadInput" type="text" spellcheck="false" placeholder="def5678 or HEAD" />
+      </label>
+      <label class="field grow">
+        <span>Path filter (optional)</span>
+        <input id="diffPathFilter" type="text" spellcheck="false" placeholder="subdir/ or file.py" />
+      </label>
+      <button id="diffBtn" type="button">Diff branches</button>
+    </div>
+    <p id="diffStatus" class="status" role="status"></p>
+    <div id="diffResults" hidden>
+      <div class="stats" id="diffStats"></div>
+      <div class="scroll" id="diffBody"></div>
+      <div class="row tools" style="margin-top:10px">
+        <button type="button" id="btnCopyDiffMd" class="secondary">Copy diff markdown</button>
+        <button type="button" id="btnDlDiffMd" class="secondary">Download diff.md</button>
+      </div>
+    </div>
+  </section>
+
   <section class="panel" id="controls" hidden>
     <div class="browse-block" id="browseBlock" hidden>
       <div class="browse-head">
